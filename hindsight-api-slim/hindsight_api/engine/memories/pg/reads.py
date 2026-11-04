@@ -719,6 +719,73 @@ class _ScopeGroupKey:
     """Whether that predicate can be answered from the GIN index on ``tags`` alone."""
 
 
+async def _shared_scope_updates(
+    conn,
+    table: str,
+    bank_id: str,
+    scopes: list[MemoryScopeWatermark],
+    tag_clause: str,
+) -> dict[str, bool] | None:
+    """Reuse the latest write for identical filters, with each page's own cutoff."""
+    by_filter: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    for position, scope in enumerate(scopes):
+        filters = (tuple(scope.tags or ()), tuple(scope.fact_types or ()))
+        by_filter.setdefault(filters, []).append(position)
+    if len(by_filter) == len(scopes):
+        return None
+
+    payload = [
+        {
+            "tags": tags,
+            "fact_types": fact_types or None,
+            "pages": [
+                {"position": position, "since": _as_utc(scopes[position].since).isoformat()} for position in positions
+            ],
+        }
+        for (tags, fact_types), positions in by_filter.items()
+    ]
+    # A match among the newest writes is already the latest for that filter.
+    # Keep the fallback tag-indexable: a plain MAX can become a time-ordered
+    # index walk that scans the whole bank for a missing tag.
+    fact_type_clause = "AND (s.fact_types IS NULL OR mu.fact_type = ANY(s.fact_types))"
+    rows = await conn.fetch(
+        f"""
+        WITH recent AS MATERIALIZED (
+            SELECT tags, fact_type, updated_at
+            FROM {table}
+            WHERE bank_id = $1 AND updated_at IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 64
+        ),
+        checked AS MATERIALIZED (
+            SELECT s.pages, COALESCE(r.latest, h.latest) AS latest
+            FROM jsonb_to_recordset($2::jsonb) AS s(tags varchar[], fact_types text[], pages jsonb)
+            LEFT JOIN LATERAL (
+                SELECT max(mu.updated_at) AS latest
+                FROM recent mu
+                WHERE TRUE
+                  {tag_clause}
+                  {fact_type_clause}
+            ) r ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT max(mu.updated_at) FILTER (WHERE mu.updated_at IS NOT NULL) AS latest
+                FROM {table} mu
+                WHERE r.latest IS NULL AND mu.bank_id = $1
+                  {tag_clause}
+                  {fact_type_clause}
+            ) h ON TRUE
+        )
+        SELECT p.position, COALESCE(c.latest > p.since, false) AS stale
+        FROM checked c
+        CROSS JOIN LATERAL jsonb_to_recordset(c.pages) AS p(position int, since timestamptz)
+        ORDER BY p.position
+        """,
+        bank_id,
+        json.dumps(payload),
+    )
+    return {scopes[row["position"]].key: row["stale"] for row in rows}
+
+
 async def any_memory_updated_since_batch(
     *,
     conn,
@@ -739,6 +806,9 @@ async def any_memory_updated_since_batch(
     decision, made per group here — the aggregate over the tag index for scopes
     whose clause that index can serve, the time-ordered ``LIMIT 1`` for the rest.
     Read that docstring first; what follows is what the *batched* form adds.
+
+    When tag-indexable scopes share a filter, find its latest matching write once
+    and compare it to every scope's own cutoff.
 
     Three details in the SQL are load-bearing:
 
@@ -819,6 +889,11 @@ async def any_memory_updated_since_batch(
 
     for key, group in by_clause.items():
         tag_clause = key.tag_clause
+        if key.indexable and len(group) > 1:
+            shared = await _shared_scope_updates(conn, table, bank_id, group, tag_clause)
+            if shared is not None:
+                results.update(shared)
+                continue
         payload = [
             {
                 "scope_key": scope.key,
