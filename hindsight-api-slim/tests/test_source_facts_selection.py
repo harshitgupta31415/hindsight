@@ -5,6 +5,8 @@ only itself, and any budget skip must be reported so a caller can tell a
 truncated map from a dangling reference.
 """
 
+from unittest.mock import Mock
+
 from hindsight_api.engine.source_facts import select_source_facts_within_budget
 
 
@@ -141,3 +143,32 @@ class TestPerObservationBudget:
 
         assert selection.ids == []
         assert selection.truncated is True
+
+    def test_token_count_is_reused_but_each_observation_pays_for_the_source(self):
+        counter = Mock(side_effect=_count_words)
+        selection = select_source_facts_within_budget(
+            source_ids_ordered=["shared", "extra"],
+            source_fact_ids_by_obs={"obs-1": ["shared"], "obs-2": ["shared", "extra"]},
+            text_by_id={"shared": "two words", "extra": "one"},
+            max_total_tokens=-1,
+            max_tokens_per_observation=2,
+            count_tokens=counter,
+        )
+        assert selection.ids == ["shared"]
+        assert selection.truncated is True
+        assert counter.call_count == 2
+
+
+def test_unlimited_sources_do_not_need_token_counts():
+    counter = Mock(side_effect=_count_words)
+    selection = select_source_facts_within_budget(
+        source_ids_ordered=["present", "missing"],
+        source_fact_ids_by_obs={"obs-1": ["present", "missing"]},
+        text_by_id={"present": "a source"},
+        max_total_tokens=-1,
+        max_tokens_per_observation=-1,
+        count_tokens=counter,
+    )
+    assert selection.ids == ["present"]
+    assert selection.truncated is False
+    counter.assert_not_called()
