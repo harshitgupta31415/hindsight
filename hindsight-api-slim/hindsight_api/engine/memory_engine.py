@@ -21019,28 +21019,30 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id,
                 )
                 by_parent: dict[str | None, list] = {}
+                root = None
                 for r in all_rows:
                     by_parent.setdefault(r["parent_id"], []).append(r)
-                if not any(r["id"] == node_id for r in all_rows):
+                    if r["id"] == node_id:
+                        root = r
+                if root is None:
                     return False
-                # BFS the subtree rooted at node_id, collecting page mental models.
+                # Walk the subtree rooted at node_id, collecting page mental models.
                 # `visited` bounds the walk: a tree corrupted before the bank lock
                 # existed (or restored from such an export) contains a parent cycle
                 # the FK does not forbid, and an unguarded walk would spin forever
                 # holding a connection and an open transaction. Visiting each node
                 # once still deletes every reachable node.
-                stack = [node_id]
+                stack = [root]
                 visited: set[str] = set()
                 mm_ids: list[str] = []
                 while stack:
-                    current = stack.pop()
+                    node_row = stack.pop()
+                    current = node_row["id"]
                     if current in visited:
                         continue
                     visited.add(current)
-                    for child in by_parent.get(current, []):
-                        stack.append(child["id"])
-                    node_row = next((r for r in all_rows if r["id"] == current), None)
-                    if node_row and node_row["mental_model_id"]:
+                    stack.extend(by_parent.get(current, ()))
+                    if node_row["mental_model_id"]:
                         mm_ids.append(node_row["mental_model_id"])
                 if tag_scope:
                     # A scoped caller deletes only what it can see. A folder that also holds
