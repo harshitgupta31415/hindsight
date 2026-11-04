@@ -170,36 +170,63 @@ async def observation_scope_counts(
     forced tag scope) keeps only the observations it admits.
     """
     groups = build_tag_groups_where_clause(tag_groups, 2)
-    scopes_select = f"""
-        SELECT COALESCE(ARRAY(SELECT unnest(tags) ORDER BY 1), '{{}}'::text[]) AS scope
-        FROM {fq_table("memory_units")}
-        WHERE bank_id = $1 AND fact_type = 'observation' {groups.sql}
-    """
-
-    total_row = await conn.fetchrow(
-        f"""
-        SELECT COUNT(*) AS total
-        FROM (SELECT DISTINCT scope FROM ({scopes_select}) s) d
-        """,
-        bank_id,
-        *groups.params,
-    )
-    total = int(total_row["total"]) if total_row else 0
-
     limit_idx = groups.next_param_offset
-    rows = await conn.fetch(
-        f"""
-        SELECT scope, COUNT(*) AS count
-        FROM ({scopes_select}) s
-        GROUP BY scope
-        ORDER BY count DESC, scope
-        LIMIT ${limit_idx} OFFSET ${limit_idx + 1}
-        """,
-        bank_id,
-        *groups.params,
-        limit,
-        offset,
-    )
+    table = fq_table("memory_units")
+    where = f"bank_id = $1 AND fact_type = 'observation' {groups.sql}"
+    scope_expr = "COALESCE(ARRAY(SELECT unnest(tags) ORDER BY 1), '{}'::text[])"
+    if getattr(conn, "backend_type", "postgresql") == "postgresql":
+        rows = await conn.fetch(
+            f"""
+            WITH raw_counts AS (
+                SELECT tags, COUNT(*) AS count
+                FROM {table}
+                WHERE {where}
+                GROUP BY tags
+            ),
+            scopes AS MATERIALIZED (
+                SELECT {scope_expr} AS scope, SUM(count)::bigint AS count
+                FROM raw_counts
+                GROUP BY 1
+            ),
+            page AS (
+                SELECT scope, count FROM scopes
+                ORDER BY count DESC, scope
+                LIMIT ${limit_idx} OFFSET ${limit_idx + 1}
+            )
+            SELECT tally.total, page.scope, page.count
+            FROM (SELECT COUNT(*) AS total FROM scopes) tally
+            LEFT JOIN page ON TRUE
+            ORDER BY page.count DESC, page.scope
+            """,
+            bank_id,
+            *groups.params,
+            limit,
+            offset,
+        )
+        # The left join returns the total even when this page has no rows.
+        total = int(rows[0]["total"])
+        rows = [row for row in rows if row["scope"] is not None]
+    else:
+        scopes_select = f"SELECT {scope_expr} AS scope FROM {table} WHERE {where}"
+        total_row = await conn.fetchrow(
+            f"SELECT COUNT(*) AS total FROM (SELECT DISTINCT scope FROM ({scopes_select}) s) d",
+            bank_id,
+            *groups.params,
+        )
+        total = int(total_row["total"]) if total_row else 0
+        rows = await conn.fetch(
+            f"""
+            SELECT scope, COUNT(*) AS count
+            FROM ({scopes_select}) s
+            GROUP BY scope
+            ORDER BY count DESC, scope
+            LIMIT ${limit_idx} OFFSET ${limit_idx + 1}
+            """,
+            bank_id,
+            *groups.params,
+            limit,
+            offset,
+        )
     return {
         "scopes": [{"tags": list(r["scope"]), "count": int(r["count"])} for r in rows],
         "total": total,
