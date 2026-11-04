@@ -629,6 +629,10 @@ async def _list_entities_tag_filtered(
     if search:
         params.append(f"%{search}%")
         search_clause = f"AND canonical_name ILIKE ${len(params)}"
+        if getattr(conn, "backend_type", "postgresql") == "postgresql":
+            return await _list_postgres_entities_by_name(
+                conn, fq_table, params, search_clause, built.sql, limit=limit, offset=offset
+            )
     # The stats are aggregated first and joined after, rather than grouping the
     # entities row directly: Oracle cannot GROUP BY the `metadata` JSON column.
     from_sql = f"""
@@ -654,6 +658,89 @@ async def _list_entities_tag_filtered(
     return {
         "items": [_entity_list_item(row) for row in rows],
         "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+async def _list_postgres_entities_by_name(
+    conn,
+    fq_table,
+    params: list[Any],
+    search_clause: str,
+    tag_clause: str,
+    *,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    """Use indexed mention lookups for one name with a small set of postings."""
+    entities = fq_table("entities")
+    ue = fq_table("unit_entities")
+    mu = fq_table("memory_units")
+    seen_at = "COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date)"
+    rows = await conn.fetch(
+        f"""
+        WITH matches AS MATERIALIZED (
+            SELECT id
+            FROM {entities}
+            WHERE bank_id = $1 {search_clause}
+        ),
+        match_count AS MATERIALIZED (
+            SELECT COUNT(*) AS n FROM matches
+        ),
+        use_probe AS MATERIALIZED (
+            SELECT CASE WHEN n = 1 THEN NOT EXISTS (
+                SELECT 1 FROM {ue}
+                WHERE entity_id = (SELECT id FROM matches LIMIT 1)
+                LIMIT 1 OFFSET 64
+            ) ELSE false END AS enabled
+            FROM match_count
+        ),
+        mentions AS (
+            SELECT ue.unit_id, ue.entity_id, {seen_at} AS seen_at
+            FROM matches e
+            JOIN {ue} ue ON ue.entity_id = e.id
+            JOIN {mu} mu ON mu.id = ue.unit_id
+            WHERE mu.bank_id = $1 {tag_clause}
+            UNION
+            SELECT mu.id, ue.entity_id, {seen_at}
+            FROM matches e
+            JOIN {ue} ue ON ue.entity_id = e.id
+            JOIN {mu} mu ON mu.source_memory_ids @> ARRAY[ue.unit_id]
+            WHERE mu.bank_id = $1 AND mu.fact_type = 'observation'
+              AND mu.source_memory_ids IS NOT NULL
+              {tag_clause}
+              AND NOT EXISTS (SELECT 1 FROM {ue} direct WHERE direct.unit_id = mu.id)
+        ),
+        stats AS MATERIALIZED (
+            SELECT entity_id, COUNT(*) AS mention_count, MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen
+            FROM mentions
+            WHERE (SELECT enabled FROM use_probe)
+            GROUP BY entity_id
+            UNION ALL
+            SELECT s.entity_id, s.mention_count, s.first_seen, s.last_seen
+            FROM ({visible_entity_stats_sql(fq_table, _ops_for(conn), tag_clause)}) s
+            JOIN matches e ON e.id = s.entity_id
+            WHERE (SELECT n FROM match_count) > 0 AND NOT (SELECT enabled FROM use_probe)
+        ),
+        page AS (
+            SELECT e.id, e.canonical_name, e.entity_kind, s.mention_count, s.first_seen, s.last_seen, e.metadata
+            FROM stats s JOIN {entities} e ON e.id = s.entity_id AND e.bank_id = $1
+            ORDER BY s.mention_count DESC, s.last_seen DESC, e.id
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+        )
+        SELECT tally.total, page.*
+        FROM (SELECT COUNT(*) AS total FROM stats) tally
+        LEFT JOIN page ON TRUE
+        ORDER BY page.mention_count DESC, page.last_seen DESC, page.id
+        """,
+        *params,
+        limit,
+        offset,
+    )
+    return {
+        "items": [_entity_list_item(row) for row in rows if row["id"] is not None],
+        "total": rows[0]["total"],
         "limit": limit,
         "offset": offset,
     }
