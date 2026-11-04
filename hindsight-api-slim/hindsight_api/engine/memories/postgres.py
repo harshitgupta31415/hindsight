@@ -959,6 +959,24 @@ class PostgresMemories(MemoriesExtension):
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id
         )
 
+    async def iter_current_document_tags(
+        self, *, conn, fq_table, bank_id: str, document_ids: list[str]
+    ) -> AsyncIterator[tuple[str, list[str] | None]]:
+        if len(document_ids) <= 1 or getattr(conn, "backend_type", "postgresql") != "postgresql":
+            async for item in super().iter_current_document_tags(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=document_ids
+            ):
+                yield item
+            return
+
+        batch_size = 1000
+        for offset in range(0, len(document_ids), batch_size):
+            batch = document_ids[offset : offset + batch_size]
+            tags_by_id = await self.documents_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=batch)
+            for document_id in batch:
+                if document_id in tags_by_id:
+                    yield document_id, tags_by_id[document_id]
+
     async def documents_tags(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, list[str]]:
         return await documents.documents_tags(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_ids=document_ids

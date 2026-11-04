@@ -3095,6 +3095,17 @@ class MemoriesExtension(Extension, ABC):
             tags=list(_record["tags"] or []) if _record is not None and "tags" in _record else None,
         )
 
+    async def iter_current_document_tags(
+        self, *, conn, fq_table, bank_id: str, document_ids: list[str]
+    ) -> AsyncIterator[tuple[str, list[str] | None]]:
+        """Yield existing documents' tags in request order for write checks."""
+        for document_id in document_ids:
+            current = await self.current_document_tags(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
+            )
+            if current.found:
+                yield document_id, current.tags
+
     async def documents_tags(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, list[str]]:
         """document id -> the tags it carries, for the ids that exist. Read to decide whether a
         tag-scoped reader may see a document's source text (#5030), so an id left out is hidden.
